@@ -211,7 +211,7 @@ class TcpMaster(Master):
         written in the mbap. Used for RTU only
         """
         response = to_data('')
-        length = 255
+        length = 511
         while len(response) < length:
             rcv_byte = self._sock.recv(1)
             if rcv_byte:
