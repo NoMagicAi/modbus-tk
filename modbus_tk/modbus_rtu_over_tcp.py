@@ -21,7 +21,7 @@ class RtuOverTcpMaster(TcpMaster):
     def _recv(self, expected_length=-1):
         """Receive the response from the slave"""
         response = to_data('')
-        length = 255
+        length = 511
         while len(response) < length:
             rcv_byte = self._sock.recv(1)
             if rcv_byte:
