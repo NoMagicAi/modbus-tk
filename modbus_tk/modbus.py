@@ -359,15 +359,25 @@ class Master(object):
 
         if slave is not None:
             # receive the data from the slave
-            response = self._recv(expected_length)
-            retval = call_hooks("modbus.Master.after_recv", (self, response))
-            if retval is not None:
-                response = retval
-            if self._verbose:
-                LOGGER.debug(get_log_buffer("<- ", response))
+            got_correct_response = False
+            retry_count = 0
+            while not got_correct_response:
+                if retry_count > 3:
+                    raise ModbusError("Slave did not respond correctly after 3 retries. ")
+                response = self._recv(expected_length)
+                retval = call_hooks("modbus.Master.after_recv", (self, response))
+                if retval is not None:
+                    response = retval
+                if self._verbose:
+                    LOGGER.debug(get_log_buffer("<- ", response))
 
-            # extract the pdu part of the response
-            response_pdu = query.parse_response(response)
+                # extract the pdu part of the response
+                try:
+                    response_pdu = query.parse_response(response)
+                    got_correct_response = True
+                except Exception as e:
+                    LOGGER.error(f"Caught Exception while parsing modbus response : {e}")
+                    retry_count += 1
 
             # analyze the received data
             (return_code, byte_2) = struct.unpack(">BB", response_pdu[0:2])
