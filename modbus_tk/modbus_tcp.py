@@ -222,7 +222,7 @@ class TcpMaster(Master):
             data += chunk
         return data
 
-    def _is_response_header_to_last_request(self, header):
+    def _response_header_matches_last_request(self, header):
         """
         Check that the MBAP and the function code match the last sent request.
         Modbus TCP has no checksum, so this is the only way to tell a response from garbage.
@@ -249,21 +249,22 @@ class TcpMaster(Master):
         garbage, e.g. a bogus response of a slave that treats every TCP segment as a request,
         and its length field cannot be trusted to skip it as a whole.
         """
-        response = self._recv_exact(MBAP_AND_FUNCTION_CODE_LENGTH)
+        header = self._recv_exact(MBAP_AND_FUNCTION_CODE_LENGTH)
         skipped = bytearray()
-        while not self._is_response_header_to_last_request(response):
-            if len(skipped) >= MAX_SKIPPED_BYTES_BEFORE_RESPONSE:
-                raise ModbusInvalidMbapError(
-                    "No response header found after skipping {0} bytes".format(len(skipped))
-                )
-            skipped += bytearray(response[:1])
-            response = response[1:] + self._recv_exact(1)
+        while (
+            not self._response_header_matches_last_request(header)
+            and len(skipped) < MAX_SKIPPED_BYTES_BEFORE_RESPONSE
+        ):
+            skipped += bytearray(header[:1])
+            header = header[1:] + self._recv_exact(1)
+        if not self._response_header_matches_last_request(header):
+            raise ModbusInvalidMbapError(
+                f"No response header found after skipping {len(skipped)} bytes: {skipped.hex(' ')}"
+            )
         if skipped:
-            LOGGER.error("Skipped {0} bytes preceding the response: {1}".format(
-                len(skipped), " ".join("{0:02x}".format(b) for b in skipped)
-            ))
-        length = struct.unpack(">H", response[4:6])[0]
-        response += self._recv_exact(max(length + 6 - MBAP_AND_FUNCTION_CODE_LENGTH, 0))
+            LOGGER.error(f"Skipped {len(skipped)} bytes preceding the response: {skipped.hex(' ')}")
+        _, _, length, _, _ = struct.unpack(MBAP_AND_FUNCTION_CODE_FORMAT, header)
+        response = header + self._recv_exact(max(length + 6 - MBAP_AND_FUNCTION_CODE_LENGTH, 0))
         retval = call_hooks("modbus_tcp.TcpMaster.after_recv", (self, response))
         if retval is not None:
             return retval
