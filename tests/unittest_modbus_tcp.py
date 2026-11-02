@@ -325,6 +325,72 @@ class TestTcpQuery(unittest.TestCase):
             i += 1
 
 
+class FakeSocket(object):
+    """Socket returning the given bytes and then an empty read, like a closed connection"""
+
+    def __init__(self, data):
+        self._data = data
+
+    def recv(self, size):
+        chunk, self._data = self._data[:size], self._data[size:]
+        return chunk
+
+
+class TestTcpMasterRecv(unittest.TestCase):
+    """Test that TcpMaster._recv finds the response to the last request in the stream"""
+
+    READ_REQUEST = bytes.fromhex("fc 48 00 00 00 06 01 04 00 00 00 6f")
+    READ_RESPONSE = bytes.fromhex("fc 48 00 00 00 07 01 04 04 00 02 00 00")
+
+    def _recv(self, stream):
+        master = modbus_tcp.TcpMaster()
+        master._sock = FakeSocket(stream)
+        master._last_request = bytearray(self.READ_REQUEST)
+        return master._recv()
+
+    def testRecvResponse(self):
+        """test that a response matching the request is returned"""
+        self.assertEqual(self.READ_RESPONSE, self._recv(self.READ_RESPONSE))
+
+    def testRecvLeavesFollowingBytesInStream(self):
+        """test that only the bytes of the response are consumed"""
+        following = bytes.fromhex("fc 49 00 00")
+        master = modbus_tcp.TcpMaster()
+        master._sock = FakeSocket(self.READ_RESPONSE + following)
+        master._last_request = bytearray(self.READ_REQUEST)
+        master._recv()
+        self.assertEqual(following, master._sock.recv(255))
+
+    def testRecvSkipsBogusResponseToRequestTail(self):
+        """test that the bogus response of a slave answering the 3 byte tail of a split request is skipped"""
+        bogus = bytes.fromhex("00 20 20 00 00 06 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(bogus + self.READ_RESPONSE))
+
+    def testRecvSkipsGarbageWithInvalidLength(self):
+        """test that garbage whose length field would swallow the response is skipped"""
+        garbage = bytes.fromhex("00 00 00 20 20 20 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(garbage + self.READ_RESPONSE))
+
+    def testRecvSkipsResponseToOtherRequest(self):
+        """test that a late response to a previous request is skipped"""
+        stale = bytes.fromhex("fc 47 00 00 00 06 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(stale + self.READ_RESPONSE))
+
+    def testRecvExceptionResponse(self):
+        """test that an exception response to the request is returned"""
+        exception_response = bytes.fromhex("fc 48 00 00 00 03 01 84 02")
+        self.assertEqual(exception_response, self._recv(exception_response))
+
+    def testRecvFailsWithoutResponseHeader(self):
+        """test that an error is raised if no response header follows the maximum amount of garbage"""
+        garbage = bytes(modbus_tcp.MAX_SKIPPED_BYTES_BEFORE_RESPONSE + modbus_tcp.MBAP_AND_FUNCTION_CODE_LENGTH)
+        self.assertRaises(modbus_tcp.ModbusInvalidMbapError, self._recv, garbage + self.READ_RESPONSE)
+
+    def testRecvFailsOnClosedConnection(self):
+        """test that an error is raised if the connection is closed before the whole response is received"""
+        self.assertRaises(modbus_tk.modbus.ModbusInvalidResponseError, self._recv, self.READ_RESPONSE[:-1])
+
+
 class TestTcpServer(unittest.TestCase):
     def setUp(self): pass
     def tearDown(self): pass
