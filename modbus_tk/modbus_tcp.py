@@ -21,6 +21,10 @@ from modbus_tk.modbus import (
 )
 from modbus_tk.utils import threadsafe_function, flush_socket, to_data
 
+MBAP_AND_FUNCTION_CODE_LENGTH = 8
+MAX_SKIPPED_BYTES_BEFORE_RESPONSE = 260
+MODBUS_EXCEPTION_FLAG = 0x80
+
 
 #-------------------------------------------------------------------------------
 class ModbusInvalidMbapError(Exception):
@@ -161,6 +165,7 @@ class TcpMaster(Master):
         self._host = host
         self._port = port
         self._sock = None
+        self._last_request = None
 
     def _do_open(self):
         """Connect to the Modbus slave"""
@@ -202,25 +207,57 @@ class TcpMaster(Master):
             #try to reconnect
             LOGGER.error('Error while flushing the socket: {0}'.format(msg))
             self._do_open()
+        self._last_request = bytearray(request)
         self._sock.send(request)
+
+    def _recv_exact(self, length):
+        """Receive exactly length bytes from the slave"""
+        data = to_data('')
+        while len(data) < length:
+            rcv_byte = self._sock.recv(1)
+            if not rcv_byte:
+                raise ModbusInvalidResponseError("Connection closed by the slave")
+            data += rcv_byte
+        return data
+
+    def _is_response_header_to_last_request(self, header):
+        """
+        Check that the MBAP and the function code match the last sent request.
+        Modbus TCP has no checksum, so this is the only way to tell a response from garbage.
+        """
+        header = bytearray(header)
+        request = self._last_request
+        return (
+            header[0:2] == request[0:2]
+            and header[2:4] == bytearray(2)
+            and header[6] == request[6]
+            and header[7] in (request[7], request[7] | MODBUS_EXCEPTION_FLAG)
+        )
 
     def _recv(self, expected_length=-1):
         """
         Receive the response from the slave
         Do not take expected_length into account because the length of the response is
         written in the mbap. Used for RTU only
+        Bytes preceding the response header are skipped one by one: the stream can contain
+        garbage, e.g. a bogus response of a slave that treats every TCP segment as a request,
+        and its length field cannot be trusted to skip it as a whole.
         """
-        response = to_data('')
-        length = 255
-        while len(response) < length:
-            rcv_byte = self._sock.recv(1)
-            if rcv_byte:
-                response += rcv_byte
-                if len(response) == 6:
-                    to_be_recv_length = struct.unpack(">HHH", response)[2]
-                    length = to_be_recv_length + 6
-            else:
-                break
+        response = self._recv_exact(MBAP_AND_FUNCTION_CODE_LENGTH)
+        skipped = bytearray()
+        while not self._is_response_header_to_last_request(response):
+            if len(skipped) >= MAX_SKIPPED_BYTES_BEFORE_RESPONSE:
+                raise ModbusInvalidMbapError(
+                    "No response header found after skipping {0} bytes".format(len(skipped))
+                )
+            skipped += bytearray(response[:1])
+            response = response[1:] + self._recv_exact(1)
+        if skipped:
+            LOGGER.error("Skipped {0} bytes preceding the response: {1}".format(
+                len(skipped), " ".join("{0:02x}".format(b) for b in skipped)
+            ))
+        length = struct.unpack(">H", response[4:6])[0]
+        response += self._recv_exact(max(length + 6 - MBAP_AND_FUNCTION_CODE_LENGTH, 0))
         retval = call_hooks("modbus_tcp.TcpMaster.after_recv", (self, response))
         if retval is not None:
             return retval
