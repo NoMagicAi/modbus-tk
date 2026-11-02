@@ -21,7 +21,9 @@ from modbus_tk.modbus import (
 )
 from modbus_tk.utils import threadsafe_function, flush_socket, to_data
 
+MBAP_AND_FUNCTION_CODE_FORMAT = ">HHHBB"
 MBAP_AND_FUNCTION_CODE_LENGTH = 8
+MODBUS_PROTOCOL_ID = 0
 MAX_SKIPPED_BYTES_BEFORE_RESPONSE = 260
 MODBUS_EXCEPTION_FLAG = 0x80
 
@@ -214,10 +216,10 @@ class TcpMaster(Master):
         """Receive exactly length bytes from the slave"""
         data = to_data('')
         while len(data) < length:
-            rcv_byte = self._sock.recv(1)
-            if not rcv_byte:
+            chunk = self._sock.recv(length - len(data))
+            if not chunk:
                 raise ModbusInvalidResponseError("Connection closed by the slave")
-            data += rcv_byte
+            data += chunk
         return data
 
     def _is_response_header_to_last_request(self, header):
@@ -225,13 +227,17 @@ class TcpMaster(Master):
         Check that the MBAP and the function code match the last sent request.
         Modbus TCP has no checksum, so this is the only way to tell a response from garbage.
         """
-        header = bytearray(header)
-        request = self._last_request
+        response_tid, response_protocol_id, _, response_unit_id, response_function_code = struct.unpack(
+            MBAP_AND_FUNCTION_CODE_FORMAT, header
+        )
+        request_tid, _, _, request_unit_id, request_function_code = struct.unpack(
+            MBAP_AND_FUNCTION_CODE_FORMAT, self._last_request[:MBAP_AND_FUNCTION_CODE_LENGTH]
+        )
         return (
-            header[0:2] == request[0:2]
-            and header[2:4] == bytearray(2)
-            and header[6] == request[6]
-            and header[7] in (request[7], request[7] | MODBUS_EXCEPTION_FLAG)
+            response_tid == request_tid
+            and response_protocol_id == MODBUS_PROTOCOL_ID
+            and response_unit_id == request_unit_id
+            and response_function_code in (request_function_code, request_function_code | MODBUS_EXCEPTION_FLAG)
         )
 
     def _recv(self, expected_length=-1):
