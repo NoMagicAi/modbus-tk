@@ -12,7 +12,9 @@
 import unittest
 import modbus_tk
 import modbus_tk.modbus_tcp as modbus_tcp
+import socket
 import threading
+import time
 import struct
 import logging
 import sys
@@ -323,6 +325,106 @@ class TestTcpQuery(unittest.TestCase):
             response_pdu = query.parse_response(response)
             self.assertEqual(to_data(pdu), response_pdu)
             i += 1
+
+
+class TestTcpMasterRecv(unittest.TestCase):
+    """Test that TcpMaster._recv finds the response to the last request sent by TcpMaster._send"""
+
+    READ_REQUEST = bytes.fromhex("fc 48 00 00 00 06 01 04 00 00 00 6f")
+    READ_RESPONSE = bytes.fromhex("fc 48 00 00 00 07 01 04 04 00 02 00 00")
+    PIECE_DELAY = 0.05
+
+    def setUp(self):
+        self.master = modbus_tcp.TcpMaster()
+        self.master._sock, self.slave = socket.socketpair()
+        self.master._sock.settimeout(1.0)
+        self.sender = None
+
+    def tearDown(self):
+        if self.sender:
+            self.sender.join()
+        self.master._sock.close()
+        self.slave.close()
+
+    def _send_request(self):
+        self.master._send(self.READ_REQUEST)
+        self.assertEqual(self.READ_REQUEST, self.slave.recv(len(self.READ_REQUEST)))
+
+    def _send_pieces_later(self, pieces, close=False):
+        def send():
+            for piece in pieces:
+                time.sleep(self.PIECE_DELAY)
+                self.slave.sendall(piece)
+            if close:
+                self.slave.shutdown(socket.SHUT_WR)
+
+        self.sender = threading.Thread(target=send)
+        self.sender.start()
+
+    def _recv(self, *pieces, close=False):
+        """Send the request, let the slave answer it with the pieces, each in a separate TCP segment"""
+        self._send_request()
+        self._send_pieces_later(pieces, close=close)
+        return self.master._recv()
+
+    def testRecvResponse(self):
+        """test that a response matching the request is returned"""
+        self.assertEqual(self.READ_RESPONSE, self._recv(self.READ_RESPONSE))
+
+    def testRecvResponseSplitIntoSegments(self):
+        """test that a response arriving in several segments, inside the header and the data, is put together"""
+        pieces = [self.READ_RESPONSE[:3], self.READ_RESPONSE[3:10], self.READ_RESPONSE[10:]]
+        self.assertEqual(self.READ_RESPONSE, self._recv(*pieces))
+
+    def testRecvMatchesRequestSentBySend(self):
+        """test that the response is matched against the transaction id of the request given to _send"""
+        response_to_previous_request = bytes.fromhex("fc 47 00 00 00 07 01 04 04 00 01 00 00")
+        self.assertEqual(self.READ_RESPONSE, self._recv(response_to_previous_request, self.READ_RESPONSE))
+
+    def testRecvLeavesFollowingBytesInStream(self):
+        """test that only the bytes of the response are consumed"""
+        following = bytes.fromhex("fc 49 00 00")
+        self._recv(self.READ_RESPONSE + following)
+        self.assertEqual(following, self.master._sock.recv(255))
+
+    def testRecvSkipsBogusResponseToSixByteRequestTail(self):
+        """test that the bogus response of the ADF gateway to the 6 byte tail of a split request is skipped"""
+        bogus = bytes.fromhex("20 20 20 20 00 06 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(bogus, self.READ_RESPONSE))
+
+    def testRecvSkipsBogusResponseToThreeByteRequestTail(self):
+        """test that the bogus response of the ADF gateway to the 3 byte tail of a split request is skipped"""
+        bogus = bytes.fromhex("20 20 20 00 00 06 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(bogus, self.READ_RESPONSE))
+
+    def testRecvSkipsGarbageWithInvalidLength(self):
+        """test that garbage whose length field would swallow the response is skipped"""
+        garbage = bytes.fromhex("00 00 00 20 20 20 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(garbage, self.READ_RESPONSE))
+
+    def testRecvSkipsLateResponseToLongestRead(self):
+        """test that a late 263 byte response to a 127 register read, longer than the Modbus limit, is skipped"""
+        register_count = 127
+        stale = struct.pack(">HHHBBB", 0xFC47, 0, 3 + 2 * register_count, 1, 4, 2 * register_count)
+        stale += bytes(2 * register_count)
+        self.assertEqual(263, len(stale))
+        self.assertEqual(self.READ_RESPONSE, self._recv(stale, self.READ_RESPONSE))
+
+    def testRecvExceptionResponse(self):
+        """test that an exception response to the request is returned"""
+        exception_response = bytes.fromhex("fc 48 00 00 00 03 01 84 02")
+        self.assertEqual(exception_response, self._recv(exception_response))
+
+    def testRecvFailsWithoutResponseHeader(self):
+        """test that an error is raised if no response header follows the maximum amount of garbage"""
+        garbage = bytes(modbus_tcp.MAX_SKIPPED_BYTES_BEFORE_RESPONSE + modbus_tcp.MBAP_AND_FUNCTION_CODE_LENGTH)
+        self.assertRaises(modbus_tcp.ModbusInvalidMbapError, self._recv, garbage, self.READ_RESPONSE)
+
+    def testRecvFailsOnClosedConnection(self):
+        """test that an error is raised if the connection is closed before the whole response is received"""
+        self.assertRaises(
+            modbus_tk.modbus.ModbusInvalidResponseError, self._recv, self.READ_RESPONSE[:-1], close=True
+        )
 
 
 class TestTcpServer(unittest.TestCase):

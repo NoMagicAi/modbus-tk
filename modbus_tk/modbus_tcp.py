@@ -21,6 +21,12 @@ from modbus_tk.modbus import (
 )
 from modbus_tk.utils import threadsafe_function, flush_socket, to_data
 
+MBAP_AND_FUNCTION_CODE_FORMAT = ">HHHBB"
+MBAP_AND_FUNCTION_CODE_LENGTH = 8
+MODBUS_PROTOCOL_ID = 0
+MAX_SKIPPED_BYTES_BEFORE_RESPONSE = 1024
+MODBUS_EXCEPTION_FLAG = 0x80
+
 
 #-------------------------------------------------------------------------------
 class ModbusInvalidMbapError(Exception):
@@ -161,6 +167,7 @@ class TcpMaster(Master):
         self._host = host
         self._port = port
         self._sock = None
+        self._last_request = None
 
     def _do_open(self):
         """Connect to the Modbus slave"""
@@ -202,25 +209,62 @@ class TcpMaster(Master):
             #try to reconnect
             LOGGER.error('Error while flushing the socket: {0}'.format(msg))
             self._do_open()
+        self._last_request = bytearray(request)
         self._sock.send(request)
+
+    def _recv_exact(self, length):
+        """Receive exactly length bytes from the slave"""
+        data = to_data('')
+        while len(data) < length:
+            chunk = self._sock.recv(length - len(data))
+            if not chunk:
+                raise ModbusInvalidResponseError("Connection closed by the slave")
+            data += chunk
+        return data
+
+    def _response_header_matches_last_request(self, header):
+        """
+        Check that the MBAP and the function code match the last sent request.
+        Modbus TCP has no checksum, so this is the only way to tell a response from garbage.
+        """
+        response_tid, response_protocol_id, _, response_unit_id, response_function_code = struct.unpack(
+            MBAP_AND_FUNCTION_CODE_FORMAT, header
+        )
+        request_tid, _, _, request_unit_id, request_function_code = struct.unpack(
+            MBAP_AND_FUNCTION_CODE_FORMAT, self._last_request[:MBAP_AND_FUNCTION_CODE_LENGTH]
+        )
+        return (
+            response_tid == request_tid
+            and response_protocol_id == MODBUS_PROTOCOL_ID
+            and response_unit_id == request_unit_id
+            and response_function_code in (request_function_code, request_function_code | MODBUS_EXCEPTION_FLAG)
+        )
 
     def _recv(self, expected_length=-1):
         """
         Receive the response from the slave
         Do not take expected_length into account because the length of the response is
         written in the mbap. Used for RTU only
+        Bytes preceding the response header are skipped one by one: the stream can contain
+        garbage, e.g. a bogus response of a slave that treats every TCP segment as a request,
+        and its length field cannot be trusted to skip it as a whole.
         """
-        response = to_data('')
-        length = 255
-        while len(response) < length:
-            rcv_byte = self._sock.recv(1)
-            if rcv_byte:
-                response += rcv_byte
-                if len(response) == 6:
-                    to_be_recv_length = struct.unpack(">HHH", response)[2]
-                    length = to_be_recv_length + 6
-            else:
-                break
+        header = self._recv_exact(MBAP_AND_FUNCTION_CODE_LENGTH)
+        skipped = bytearray()
+        while (
+            not self._response_header_matches_last_request(header)
+            and len(skipped) < MAX_SKIPPED_BYTES_BEFORE_RESPONSE
+        ):
+            skipped += bytearray(header[:1])
+            header = header[1:] + self._recv_exact(1)
+        if not self._response_header_matches_last_request(header):
+            raise ModbusInvalidMbapError(
+                f"No response header found after skipping {len(skipped)} bytes: {skipped.hex(' ')}"
+            )
+        if skipped:
+            LOGGER.error(f"Skipped {len(skipped)} bytes preceding the response: {skipped.hex(' ')}")
+        _, _, length, _, _ = struct.unpack(MBAP_AND_FUNCTION_CODE_FORMAT, header)
+        response = header + self._recv_exact(max(length + 6 - MBAP_AND_FUNCTION_CODE_LENGTH, 0))
         retval = call_hooks("modbus_tcp.TcpMaster.after_recv", (self, response))
         if retval is not None:
             return retval
