@@ -387,9 +387,14 @@ class TestTcpMasterRecv(unittest.TestCase):
         self._recv(self.READ_RESPONSE + following)
         self.assertEqual(following, self.master._sock.recv(255))
 
-    def testRecvSkipsBogusResponseToRequestTail(self):
-        """test that the bogus response of a slave answering the 3 byte tail of a split request is skipped"""
-        bogus = bytes.fromhex("00 20 20 00 00 06 01 10 00 00 00 46")
+    def testRecvSkipsBogusResponseToSixByteRequestTail(self):
+        """test that the bogus response of the ADF gateway to the 6 byte tail of a split request is skipped"""
+        bogus = bytes.fromhex("20 20 20 20 00 06 01 10 00 00 00 46")
+        self.assertEqual(self.READ_RESPONSE, self._recv(bogus, self.READ_RESPONSE))
+
+    def testRecvSkipsBogusResponseToThreeByteRequestTail(self):
+        """test that the bogus response of the ADF gateway to the 3 byte tail of a split request is skipped"""
+        bogus = bytes.fromhex("20 20 20 00 00 06 01 10 00 00 00 46")
         self.assertEqual(self.READ_RESPONSE, self._recv(bogus, self.READ_RESPONSE))
 
     def testRecvSkipsGarbageWithInvalidLength(self):
